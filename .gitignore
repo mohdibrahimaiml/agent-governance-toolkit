@@ -458,6 +458,7 @@ _site/
 
 # Build artifacts and caches
 dist/
+site/
 .hypothesis/
 .pytest_cache/
 .ruff_cache/

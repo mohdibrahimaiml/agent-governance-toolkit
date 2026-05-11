@@ -83,7 +83,7 @@ extra_css:
   - stylesheets/mslearn.css
 
 extra_javascript:
-  - https://unpkg.com/mermaid@11.4.1/dist/mermaid.min.js
+  - javascripts/mermaid.min.js
   - javascripts/mermaid.js
 
 nav:

@@ -4,6 +4,7 @@
 package agentmesh
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -86,7 +87,7 @@ func (pe *PolicyEngine) Evaluate(action string, context map[string]interface{}) 
 	for _, rule := range pe.rules {
 		if matchAction(rule.Action, action) && matchConditions(rule.Conditions, context) {
 			if rule.MaxCalls > 0 {
-				decision := pe.checkRateLimit(rule)
+				decision := pe.checkRateLimit(rule, context)
 				pe.mu.Unlock()
 				return decision
 			}
@@ -128,9 +129,29 @@ func (pe *PolicyEngine) Evaluate(action string, context map[string]interface{}) 
 	return Allow
 }
 
+// rateLimitContextString returns a stable string representation of a
+// context value for use in the rate-limit composite key. Non-string
+// values fall through to fmt.Sprint to handle the common case where
+// an upstream caller plumbs int agent IDs or similar.
+func rateLimitContextString(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return fmt.Sprint(v)
+}
+
 // checkRateLimit tracks and enforces per-rule call limits within a time window.
-func (pe *PolicyEngine) checkRateLimit(rule PolicyRule) PolicyDecision {
-	key := rule.Action
+// The window state is keyed by (rule action, agent_id, tenant) so a single
+// noisy caller does not exhaust the budget for all other agents or tenants.
+// Missing context keys collapse to an empty segment — callers that don't
+// supply agent_id / tenant retain the previous globally-scoped behavior.
+func (pe *PolicyEngine) checkRateLimit(rule PolicyRule, context map[string]interface{}) PolicyDecision {
+	agentID := rateLimitContextString(context["agent_id"])
+	tenant := rateLimitContextString(context["tenant"])
+	key := rule.Action + "\x1f" + agentID + "\x1f" + tenant
 	now := time.Now()
 
 	window, err := time.ParseDuration(rule.Window)
@@ -157,24 +178,53 @@ func (pe *PolicyEngine) checkRateLimit(rule PolicyRule) PolicyDecision {
 	return Allow
 }
 
-// LoadFromYAML loads rules from a YAML file, appending to existing rules.
+// LoadFromYAML replaces the engine's rule set with the rules from a YAML
+// file. Existing rules are discarded on success; on parse or I/O error the
+// previous rule set is left intact. This matches the natural semantics of a
+// "load" verb and prevents the rule set from doubling when the same file is
+// re-read (e.g. on config reload).
+//
+// To extend the rule set without replacing it, use MergeFromYAML.
 func (pe *PolicyEngine) LoadFromYAML(path string) error {
-	data, err := os.ReadFile(path)
+	rules, err := readPolicyRulesFromYAML(path)
 	if err != nil {
 		return err
+	}
+
+	pe.mu.Lock()
+	defer pe.mu.Unlock()
+	pe.rules = rules
+	return nil
+}
+
+// MergeFromYAML appends rules from a YAML file to the engine's existing rule
+// set. Use this when composing rules from multiple files; use LoadFromYAML
+// when reloading a single canonical rule set.
+func (pe *PolicyEngine) MergeFromYAML(path string) error {
+	rules, err := readPolicyRulesFromYAML(path)
+	if err != nil {
+		return err
+	}
+
+	pe.mu.Lock()
+	defer pe.mu.Unlock()
+	pe.rules = append(pe.rules, rules...)
+	return nil
+}
+
+func readPolicyRulesFromYAML(path string) ([]PolicyRule, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
 	}
 
 	var loaded struct {
 		Rules []PolicyRule `yaml:"rules"`
 	}
 	if err := yaml.Unmarshal(data, &loaded); err != nil {
-		return err
+		return nil, err
 	}
-
-	pe.mu.Lock()
-	defer pe.mu.Unlock()
-	pe.rules = append(pe.rules, loaded.Rules...)
-	return nil
+	return loaded.Rules, nil
 }
 
 func matchAction(pattern, action string) bool {

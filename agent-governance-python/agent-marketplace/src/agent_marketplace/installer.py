@@ -4,11 +4,24 @@
 Plugin Installer
 
 Download, verify, install, and uninstall AgentMesh plugins with dependency
-resolution and basic plugin sandboxing (restricted imports).
+resolution and install-time restricted-import scanning.
+
+Security contract
+-----------------
+* **Install time** — :meth:`PluginInstaller.install` calls
+  :meth:`PluginInstaller.scan_source_files` on every ``*.py`` file that
+  lands in the plugin directory and raises :class:`~agent_marketplace.manifest.MarketplaceError`
+  if any file imports a module from :data:`RESTRICTED_MODULES`.
+* **Runtime** — full subprocess isolation with import blocking is provided
+  by ``agentmesh.marketplace.sandbox.PluginSandbox``.
+
+:func:`check_sandbox` is a **policy predicate** — it returns ``True``/``False``
+for a single module name but does *not* block any import by itself.
 """
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 import shutil
@@ -18,6 +31,7 @@ from types import MappingProxyType
 from typing import Any, Mapping, Optional
 
 import yaml
+from packaging.requirements import InvalidRequirement, Requirement
 
 from agent_marketplace.manifest import (
     MANIFEST_FILENAME,
@@ -132,6 +146,18 @@ class PluginInstaller:
         data = manifest.model_dump(mode="json")
         _atomic_write_yaml(manifest_file, data)
 
+        # Scan any bundled Python source files for restricted imports.
+        violations = self.scan_source_files(dest)
+        if violations:
+            try:
+                shutil.rmtree(dest)
+            except OSError:
+                pass
+            raise MarketplaceError(
+                f"Plugin {name}@{manifest.version} imports restricted modules: "
+                + "; ".join(violations)
+            )
+
         logger.info("Installed plugin %s@%s to %s", name, manifest.version, dest)
         return dest
 
@@ -245,16 +271,76 @@ class PluginInstaller:
 
     @staticmethod
     def check_sandbox(module_name: str) -> bool:
-        """Check whether a module import is allowed under sandboxing rules.
+        """Return whether *module_name* is permitted under the sandbox policy.
+
+        This is a **policy predicate** — it answers "is this module on the
+        restricted list?" but does *not* block any import by itself.
+        Install-time enforcement is performed by :meth:`scan_source_files`,
+        which :meth:`install` calls automatically.  Full runtime enforcement
+        (including dynamic imports) requires
+        ``agentmesh.marketplace.sandbox.PluginSandbox``.
 
         Args:
-            module_name: Fully-qualified module name.
+            module_name: Fully-qualified module name (e.g. ``"os.path"``).
 
         Returns:
-            ``True`` if the import is allowed, ``False`` otherwise.
+            ``True`` if the module is **allowed**, ``False`` if it is
+            **restricted**.
         """
         top_level = module_name.split(".")[0]
         return top_level not in RESTRICTED_MODULES
+
+    @staticmethod
+    def scan_source_files(plugin_dir: Path) -> list[str]:
+        """Scan Python source files in *plugin_dir* for restricted imports.
+
+        Parses every ``*.py`` file under *plugin_dir* with :mod:`ast` and
+        reports any ``import X`` or ``from X import ...`` statements that
+        reference a top-level module in :data:`RESTRICTED_MODULES`.
+
+        .. note::
+
+            Dynamic import calls such as ``__import__("subprocess")`` or
+            ``importlib.import_module("os")`` are **not** detected by this
+            scan.  For full runtime enforcement use
+            ``agentmesh.marketplace.sandbox.PluginSandbox``.
+
+        Args:
+            plugin_dir: Directory containing the installed plugin files.
+
+        Returns:
+            List of human-readable violation strings (one per offending
+            import statement).  An empty list means no restricted imports
+            were found.
+        """
+        violations: list[str] = []
+        for py_file in sorted(plugin_dir.rglob("*.py")):
+            try:
+                source = py_file.read_text(encoding="utf-8")
+            except OSError as exc:
+                logger.warning("Could not read %s for sandbox scan: %s", py_file, exc)
+                continue
+            try:
+                tree = ast.parse(source, filename=str(py_file))
+            except SyntaxError as exc:
+                logger.warning("Could not parse %s for sandbox scan: %s", py_file, exc)
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        top = alias.name.split(".")[0]
+                        if top in RESTRICTED_MODULES:
+                            violations.append(
+                                f"{py_file}: imports '{alias.name}'"
+                            )
+                elif isinstance(node, ast.ImportFrom):
+                    if node.module:
+                        top = node.module.split(".")[0]
+                        if top in RESTRICTED_MODULES:
+                            violations.append(
+                                f"{py_file}: imports from '{node.module}'"
+                            )
+        return violations
 
 
 def _atomic_write_yaml(path: Path, data: Any) -> None:
@@ -282,14 +368,24 @@ def _atomic_write_yaml(path: Path, data: Any) -> None:
 
 
 def _parse_dependency(dep_spec: str) -> tuple[str, Optional[str]]:
-    """Parse a dependency specifier like ``plugin-name>=1.0.0``.
+    """Parse a PEP 508 dependency specifier like ``plugin-name>=1.0.0``.
 
-    Returns:
-        Tuple of (name, version_or_none).
+    Returns a ``(name, version_or_none)`` tuple. ``version`` is the pinned
+    string from an ``==X`` specifier when one is present; otherwise ``None``
+    so the registry resolves the latest matching version. Compound
+    specifiers (``>=1.0,<2.0``), inequality (``!=``), and compatible-release
+    (``~=``) all return ``None`` instead of being mis-parsed as a literal
+    version string.
+
+    Raises:
+        MarketplaceError: If ``dep_spec`` is not a valid PEP 508 requirement.
     """
-    for op in (">=", "==", "<=", ">", "<"):
-        if op in dep_spec:
-            name, version = dep_spec.split(op, 1)
-            return name.strip(), version.strip()
-    return dep_spec.strip(), None
+    try:
+        req = Requirement(dep_spec)
+    except InvalidRequirement as exc:
+        raise MarketplaceError(f"Invalid dependency specifier {dep_spec!r}: {exc}") from exc
+    for spec in req.specifier:
+        if spec.operator == "==":
+            return req.name, spec.version
+    return req.name, None
 

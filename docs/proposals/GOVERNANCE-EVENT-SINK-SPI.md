@@ -134,7 +134,7 @@ belongs in.
 
 ```mermaid
 flowchart LR
-    subgraph A["Agent host"]
+    subgraph A["AGT (we ship this)"]
         K[kernel + hypervisor] --> D[in-process<br/>dispatcher]
         D --> SO[StdoutEventSink]
         D --> OE["OtlpEventSink<br/>queue + local spool"]
@@ -143,17 +143,30 @@ flowchart LR
     SO --> J[stdout / journald]
     OE -->|OTLP gRPC/HTTP| C
 
-    subgraph CH["Collector host (sidecar / daemonset)"]
+    subgraph CH["Customer-operated OpenTelemetry Collector"]
         C[otlp receiver] --> B[batch +<br/>persistent_queue]
-        B --> ED[datadog exporter]
-        B --> ES[splunk exporter]
-        B --> EA[azuremonitor exporter]
+        B --> EX[vendor exporters<br/>configured by customer]
     end
 
-    ED --> V1[Datadog]
-    ES --> V2[Splunk]
-    EA --> V3[Sentinel / Defender]
+    EX --> V["Customer's chosen backend(s)<br/>Datadog / Splunk / Sentinel /<br/>Defender / Honeycomb / Dynatrace / ..."]
+
+    classDef agt fill:#e8f0ff,stroke:#3366cc;
+    classDef customer fill:#fff5e6,stroke:#cc7a00;
+    class A agt;
+    class CH,V customer;
 ```
+
+**Scope boundaries.** Only the left-hand box is AGT's responsibility — the
+kernel, the dispatcher, and the sinks. Once `OtlpEventSink` pushes OTLP over
+the wire, everything to the right is **customer-operated standard
+OpenTelemetry infrastructure**. AGT does not ship, configure, or operate the
+Collector or any vendor exporter; the customer (or their platform team)
+deploys the Collector as a sidecar, DaemonSet, or remote gateway and points
+its exporters at whichever SIEM/XDR/observability backend they already run.
+
+This gives three clean ownership boundaries: AGT owns event production and
+the SPI; the customer owns Collector deployment and vendor routing; the
+vendor owns the backend.
 
 Two invariants make the pipeline safe across crashes:
 

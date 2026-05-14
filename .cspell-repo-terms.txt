@@ -160,3 +160,6 @@ dataschema
 backpressure
 Backpressure
 dataclasses
+endswith
+rfind
+lstrip

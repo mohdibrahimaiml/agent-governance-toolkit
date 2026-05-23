@@ -106,8 +106,10 @@ classmethod
 codepoint
 comspec
 containerapps
+containerd
 contoso
 cref
+crun
 dataclass
 dataclasses
 dataset_id
@@ -116,6 +118,7 @@ davidequarracino
 dbt
 dearmor
 defi
+delenv
 demux
 deprioritized
 dids

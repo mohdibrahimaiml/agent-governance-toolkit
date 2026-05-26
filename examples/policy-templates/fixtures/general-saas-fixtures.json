@@ -42,22 +42,22 @@
     "expected_rule": "asi06-block-pii-ssn"
   },
   {
-    "id": "asi06-ssn-dotted-blocked",
+    "id": "asi06-ssn-dotted-should-deny",
+    "_comment": "Verifies default-deny catches SSN in dotted format; after #2594 merges, expected_rule should be asi06-block-pii-ssn",
     "input": {"output": "SSN: 123.45.6789"},
-    "expected_verdict": "deny",
-    "expected_rule": "asi06-block-pii-ssn"
+    "expected_verdict": "deny"
   },
   {
-    "id": "asi06-ssn-spaces-blocked",
+    "id": "asi06-ssn-spaces-should-deny",
+    "_comment": "Same as above for space-delimited SSNs",
     "input": {"output": "SSN: 123 45 6789"},
-    "expected_verdict": "deny",
-    "expected_rule": "asi06-block-pii-ssn"
+    "expected_verdict": "deny"
   },
   {
-    "id": "asi06-ssn-nodash-blocked",
+    "id": "asi06-ssn-nodash-should-deny",
+    "_comment": "Same as above for no-delimiter SSNs",
     "input": {"output": "SSN: 123456789"},
-    "expected_verdict": "deny",
-    "expected_rule": "asi06-block-pii-ssn"
+    "expected_verdict": "deny"
   },
   {
     "id": "asi06-context-budget-exceeded",

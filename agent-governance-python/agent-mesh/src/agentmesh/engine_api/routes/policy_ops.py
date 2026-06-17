@@ -74,11 +74,13 @@ def _safe_policy_dir(request: Request, override: str | None) -> str:
     if override is None:
         return base
     candidate = os.path.realpath(override)
-    try:
-        contained = os.path.commonpath([base, candidate]) == base
-    except ValueError:
-        contained = False
-    if not contained:
+    if candidate == base:
+        return base
+    # Containment guard: the resolved override must sit strictly inside the engine
+    # policy root, otherwise an HTTP client could steer the file-reading replay engine
+    # at arbitrary server paths. The ``startswith`` check on the normalized (realpath)
+    # value is the recognized path-traversal sanitizer.
+    if not candidate.startswith(base + os.sep):
         raise ApiError(
             422,
             FIXTURE_LOAD_ERROR,

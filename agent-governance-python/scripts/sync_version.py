@@ -14,7 +14,7 @@ deliberately exempts ``agt-policies`` (5.x) and the ACS line
 
 Usage::
 
-    python scripts/sync_version.py            # rewrite family pyprojects to VERSION
+    python scripts/sync_version.py            # rewrite each family pyproject file to VERSION
     python scripts/sync_version.py --check     # fail if any family pyproject drifted
 """
 
@@ -42,7 +42,7 @@ def family_major(version: str) -> str:
     return version.split(".", 1)[0]
 
 
-def iter_pyprojects() -> list[Path]:
+def iter_pyproject_files() -> list[Path]:
     return sorted(p for p in ROOT.rglob("pyproject.toml") if p.is_file())
 
 
@@ -57,7 +57,7 @@ def sync(check_only: bool) -> int:
     drifted: list[tuple[Path, str]] = []
     rewritten: list[Path] = []
 
-    for pyproject in iter_pyprojects():
+    for pyproject in iter_pyproject_files():
         text = pyproject.read_text(encoding="utf-8")
         version = current_version(text)
         # Only manage the version-aligned family; skip packages on a different

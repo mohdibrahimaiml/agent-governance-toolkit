@@ -9,7 +9,7 @@ use std::path::Path;
 
 const DATA_PATH_KEYS: [&str; 2] = ["data", "data_paths"];
 
-fn resolve_relative_string(value: &str, base_dir: &Path) -> Option<String> {
+pub(crate) fn resolve_relative_string(value: &str, base_dir: &Path) -> Option<String> {
     if value.is_empty() {
         return None;
     }

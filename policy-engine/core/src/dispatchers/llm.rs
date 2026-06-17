@@ -128,6 +128,37 @@ impl LlmProvider {
     }
 }
 
+/// Resolve the system prompt for an LLM annotator from exactly one configured
+/// source. Inline `system_prompt` (or its `prompt` alias) wins, then a
+/// manifest relative `system_prompt_file` read from disk, then a pinned
+/// `system_prompt_url` fetched over the extends trust gate. With no source the
+/// preset default is used. The manifest validator already rejects more than
+/// one source, so the precedence here only orders the single configured case.
+/// Any read or fetch failure fails closed as an annotator error.
+fn resolve_system_prompt(
+    annotator_name: &str,
+    fields: &BTreeMap<String, JsonValue>,
+) -> Result<String, RuntimeError> {
+    if let Some(text) = http::optional_string_field(fields, FIELD_SYSTEM_PROMPT)
+        .or_else(|| http::optional_string_field(fields, FIELD_PROMPT))
+    {
+        return Ok(text.to_string());
+    }
+    if let Some(path) = http::optional_string_field(fields, FIELD_SYSTEM_PROMPT_FILE) {
+        return std::fs::read_to_string(path).map_err(|error| {
+            resolve::failed(
+                annotator_name,
+                format!("failed to read system_prompt_file '{path}': {error}"),
+            )
+        });
+    }
+    if let Some(value) = fields.get(FIELD_SYSTEM_PROMPT_URL) {
+        return crate::manifest::fetch_pinned_https_text(value, crate::Limits::default())
+            .map_err(|error| resolve::failed(annotator_name, error.detail().to_string()));
+    }
+    Ok(DEFAULT_SYSTEM_PROMPT.to_string())
+}
+
 impl LlmConfig {
     fn from_fields(
         annotator_name: &str,
@@ -142,10 +173,7 @@ impl LlmConfig {
                 _ => DEFAULT_MODEL,
             })
             .to_string();
-        let prompt = http::optional_string_field(fields, FIELD_SYSTEM_PROMPT)
-            .or_else(|| http::optional_string_field(fields, FIELD_PROMPT))
-            .unwrap_or(DEFAULT_SYSTEM_PROMPT)
-            .to_string();
+        let prompt = resolve_system_prompt(annotator_name, fields)?;
         Ok(Self {
             provider,
             endpoint: opt_string(fields, FIELD_ENDPOINT),
@@ -1033,6 +1061,52 @@ mod tests {
             )
             .expect_err("HTTP error fails");
 
+        assert!(matches!(error, RuntimeError::AnnotationFailed(_)));
+    }
+
+    #[test]
+    fn system_prompt_file_is_read_into_the_system_message() {
+        let path = std::env::temp_dir().join(format!(
+            "acs-system-prompt-{}-{:?}.txt",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, "classify strictly and audit").unwrap();
+        let (_output, request) = dispatch(
+            annotator(&[
+                (FIELD_PROVIDER, json!("openai_compatible")),
+                (
+                    FIELD_ENDPOINT,
+                    json!("http://127.0.0.1:8000/v1/chat/completions"),
+                ),
+                (FIELD_SYSTEM_PROMPT_FILE, json!(path.to_string_lossy())),
+            ]),
+            r#"{"choices":[{"message":{"content":"{\"label\":\"safe\"}"}}]}"#,
+        );
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            request.body[REQUEST_MESSAGES][0][REQUEST_CONTENT],
+            json!("classify strictly and audit")
+        );
+    }
+
+    #[test]
+    fn missing_system_prompt_file_fails_closed() {
+        let transport = StubHttpTransport::with_response(200, r#"{"choices":[]}"#);
+        let error = LlmAnnotator::new()
+            .dispatch_with_transport(
+                "judge",
+                &annotator(&[
+                    (FIELD_PROVIDER, json!("openai_compatible")),
+                    (
+                        FIELD_SYSTEM_PROMPT_FILE,
+                        json!("/nonexistent/acs/prompt.txt"),
+                    ),
+                ]),
+                &pi(),
+                &transport,
+            )
+            .expect_err("missing file fails closed");
         assert!(matches!(error, RuntimeError::AnnotationFailed(_)));
     }
 }

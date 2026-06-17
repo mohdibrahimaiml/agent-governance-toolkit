@@ -1,10 +1,22 @@
 use crate::{
-    annotation::{AnnotationConfig, AnnotatorConfig},
+    annotation::{AnnotationConfig, AnnotatorConfig, AnnotatorType},
     constants::manifest_version,
     paths::PathRoot,
-    policy::{validate_policy_binding, validate_policy_definition, PolicyBinding, PolicyConfig},
+    policy::{
+        resolve_relative_string, validate_policy_binding, validate_policy_definition,
+        PolicyBinding, PolicyConfig,
+    },
     InterventionPoint, JsonPath, JsonValue, Limits, RuntimeError,
 };
+
+// LLM annotator prompt source field names. These mirror the constants in the
+// feature gated `dispatchers::constants` module. They are duplicated here
+// because manifest validation is always compiled while the bundled
+// dispatchers are gated behind the `default-dispatchers` feature.
+const FIELD_SYSTEM_PROMPT: &str = "system_prompt";
+const FIELD_PROMPT: &str = "prompt";
+const FIELD_SYSTEM_PROMPT_FILE: &str = "system_prompt_file";
+const FIELD_SYSTEM_PROMPT_URL: &str = "system_prompt_url";
 use serde::{Deserialize, Serialize};
 use serde_json::Map;
 use std::{
@@ -185,6 +197,15 @@ impl Manifest {
         for intervention_point in self.intervention_points.values_mut() {
             intervention_point.policy.resolve_relative_paths(base_dir);
         }
+        for annotator in self.annotators.values_mut() {
+            if let Some(JsonValue::String(path)) =
+                annotator.fields.get_mut(FIELD_SYSTEM_PROMPT_FILE)
+            {
+                if let Some(resolved) = resolve_relative_string(path, base_dir) {
+                    *path = resolved;
+                }
+            }
+        }
     }
 
     pub fn from_path_with_limits(
@@ -294,6 +315,10 @@ impl Manifest {
                     "annotator names must not be empty".to_string(),
                 ));
             }
+        }
+
+        for (annotator_name, annotator) in &self.annotators {
+            validate_annotator_prompt_sources(annotator_name, annotator)?;
         }
 
         for (intervention_point, config) in &self.intervention_points {
@@ -795,6 +820,128 @@ fn validate_extends_trust(extends: &ManifestExtends) -> Result<(), RuntimeError>
         }
     }
     Ok(())
+}
+
+/// Validate the prompt source declared on an annotator. The LLM annotator
+/// preset accepts an inline `system_prompt` (or its `prompt` alias), a
+/// manifest relative `system_prompt_file`, or a pinned `system_prompt_url`.
+/// At most one source may be set. A `system_prompt_url` MUST be an HTTPS URL
+/// carrying a `sha256` or `integrity` pin, matching the extends trust gate.
+/// The check runs for every construction path because `Manifest::validate`
+/// is called by both the file loader and the runtime constructor.
+fn validate_annotator_prompt_sources(
+    name: &str,
+    annotator: &AnnotatorConfig,
+) -> Result<(), RuntimeError> {
+    let fields = &annotator.fields;
+    let has_inline = fields.contains_key(FIELD_SYSTEM_PROMPT) || fields.contains_key(FIELD_PROMPT);
+    let has_file = fields.contains_key(FIELD_SYSTEM_PROMPT_FILE);
+    let has_url = fields.contains_key(FIELD_SYSTEM_PROMPT_URL);
+
+    if (has_file || has_url) && annotator.annotator_type != AnnotatorType::Llm {
+        return Err(RuntimeError::ManifestInvalid(format!(
+            "annotator '{name}' declares a system prompt source but only the 'llm' annotator type consumes one"
+        )));
+    }
+
+    let source_count = [has_inline, has_file, has_url]
+        .into_iter()
+        .filter(|set| *set)
+        .count();
+    if source_count > 1 {
+        return Err(RuntimeError::ManifestInvalid(format!(
+            "annotator '{name}' must declare at most one of system_prompt/prompt, system_prompt_file, or system_prompt_url"
+        )));
+    }
+
+    if has_file {
+        match fields.get(FIELD_SYSTEM_PROMPT_FILE) {
+            Some(JsonValue::String(value)) if !value.trim().is_empty() => {}
+            _ => {
+                return Err(RuntimeError::ManifestInvalid(format!(
+                    "annotator '{name}' system_prompt_file must be a non empty string"
+                )))
+            }
+        }
+    }
+
+    if let Some(value) = fields.get(FIELD_SYSTEM_PROMPT_URL) {
+        validate_pinned_https_url(&format!("annotator '{name}' system_prompt_url"), value)?;
+    }
+
+    Ok(())
+}
+
+/// Validate that a manifest field is a pinned HTTPS URL object. The value MUST
+/// be an object with a `url` member and a `sha256` or `integrity` pin, the URL
+/// MUST be HTTPS, and the two pin forms MUST NOT appear together. Reused by the
+/// annotator `system_prompt_url` and the rego `bundle_url` fields. Unlike
+/// extends, an unpinned URL is rejected so a default dispatcher never trusts an
+/// unverified remote artefact. Returns the parsed pin for the caller.
+pub(crate) fn validate_pinned_https_url(
+    context: &str,
+    value: &JsonValue,
+) -> Result<ManifestUrlExtends, RuntimeError> {
+    let url_extends: ManifestUrlExtends = serde_json::from_value(value.clone()).map_err(|err| {
+        RuntimeError::ManifestInvalid(format!(
+            "{context} must be an object with 'url' and a 'sha256' or 'integrity' pin: {err}"
+        ))
+    })?;
+    if url_extends.integrity.is_none() && url_extends.sha256.is_none() {
+        return Err(RuntimeError::ManifestInvalid(format!(
+            "{context} must declare a 'sha256' or 'integrity' pin"
+        )));
+    }
+    validate_extends_trust(&ManifestExtends::Url(url_extends.clone()))?;
+    validate_https_url(&url_extends.url)?;
+    Ok(url_extends)
+}
+
+/// Fetch a pinned HTTPS artefact at dispatch time over the extends fetch path
+/// and trust gate. Reused by the bundled LLM dispatcher (system prompt) and the
+/// bundled OPA dispatcher (rego bundle). Fails closed on a non HTTPS URL, a
+/// missing pin, a fetch error, a size breach, or a hash mismatch. The body is
+/// capped at `limits.max_manifest_url_bytes`, the same cap as URL extends.
+#[cfg(any(feature = "default-dispatchers", feature = "opa"))]
+pub(crate) fn fetch_pinned_https_bytes(
+    value: &JsonValue,
+    limits: Limits,
+) -> Result<Vec<u8>, RuntimeError> {
+    fetch_pinned_https_bytes_with(value, limits, &HttpExtendsFetcher)
+}
+
+#[cfg(any(feature = "default-dispatchers", feature = "opa", test))]
+fn fetch_pinned_https_bytes_with(
+    value: &JsonValue,
+    limits: Limits,
+    fetcher: &dyn ExtendsFetcher,
+) -> Result<Vec<u8>, RuntimeError> {
+    let url_extends = validate_pinned_https_url("pinned URL", value)?;
+    let extends = ManifestExtends::Url(url_extends.clone());
+    let normalized = validate_https_url(&url_extends.url)?;
+    let body = fetcher.fetch(&normalized, limits)?;
+    if body.len() > limits.max_manifest_url_bytes {
+        return Err(RuntimeError::ResourceLimitExceeded(format!(
+            "pinned URL body from '{normalized}' exceeds limit {}",
+            limits.max_manifest_url_bytes
+        )));
+    }
+    verify_extends_hash(&extends, &normalized, &body)?;
+    Ok(body)
+}
+
+/// Fetch a pinned HTTPS prompt and decode it as UTF-8 text. Used by the bundled
+/// LLM dispatcher so a default judge reads its system prompt from a verified
+/// remote source.
+#[cfg(feature = "default-dispatchers")]
+pub(crate) fn fetch_pinned_https_text(
+    value: &JsonValue,
+    limits: Limits,
+) -> Result<String, RuntimeError> {
+    let body = fetch_pinned_https_bytes(value, limits)?;
+    String::from_utf8(body).map_err(|err| {
+        RuntimeError::ManifestInvalid(format!("pinned URL body is not valid UTF-8: {err}"))
+    })
 }
 
 fn resolve_extends_entry(
@@ -1989,5 +2136,150 @@ intervention_points:
             hex_sha256(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    fn llm_manifest(annotator_body: &str) -> String {
+        format!(
+            r#"agent_control_specification_version: 0.3.1-beta
+policies:
+  p:
+    type: test
+annotators:
+  judge:
+    type: llm
+{annotator_body}intervention_points:
+  input:
+    policy_target: $snap.input
+    policy:
+      id: p
+"#
+        )
+    }
+
+    #[test]
+    fn llm_annotator_accepts_inline_system_prompt() {
+        let manifest = Manifest::from_yaml_str(&llm_manifest("    system_prompt: be strict\n"))
+            .expect("inline prompt is valid");
+        assert!(manifest.annotators.contains_key("judge"));
+    }
+
+    #[test]
+    fn llm_annotator_accepts_system_prompt_file_alone() {
+        Manifest::from_yaml_str(&llm_manifest("    system_prompt_file: ./prompt.txt\n"))
+            .expect("file prompt is valid");
+    }
+
+    #[test]
+    fn llm_annotator_rejects_inline_and_file_together() {
+        let error = Manifest::from_yaml_str(&llm_manifest(
+            "    system_prompt: inline\n    system_prompt_file: ./prompt.txt\n",
+        ))
+        .unwrap_err();
+        assert!(error.detail().contains("at most one"), "got: {error}");
+    }
+
+    #[test]
+    fn llm_annotator_rejects_prompt_alias_and_url_together() {
+        let body = "    prompt: inline\n    system_prompt_url:\n      url: https://policy.example/p.txt\n      sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+        let error = Manifest::from_yaml_str(&llm_manifest(body)).unwrap_err();
+        assert!(error.detail().contains("at most one"), "got: {error}");
+    }
+
+    #[test]
+    fn llm_annotator_rejects_system_prompt_url_without_pin() {
+        let body = "    system_prompt_url:\n      url: https://policy.example/p.txt\n";
+        let error = Manifest::from_yaml_str(&llm_manifest(body)).unwrap_err();
+        assert!(
+            error.detail().contains("must declare a 'sha256'"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn llm_annotator_rejects_non_https_system_prompt_url() {
+        let body = "    system_prompt_url:\n      url: http://policy.example/p.txt\n      sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+        let error = Manifest::from_yaml_str(&llm_manifest(body)).unwrap_err();
+        assert!(
+            error.detail().contains("only https is allowed"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn system_prompt_file_on_classifier_is_rejected() {
+        let yaml = r#"agent_control_specification_version: 0.3.1-beta
+policies:
+  p:
+    type: test
+annotators:
+  c:
+    type: classifier
+    system_prompt_file: ./prompt.txt
+intervention_points:
+  input:
+    policy_target: $snap.input
+    policy:
+      id: p
+"#;
+        let error = Manifest::from_yaml_str(yaml).unwrap_err();
+        assert!(error.detail().contains("only the 'llm'"), "got: {error}");
+    }
+
+    #[test]
+    fn resolve_relative_paths_rewrites_system_prompt_file() {
+        let mut manifest =
+            Manifest::from_yaml_str(&llm_manifest("    system_prompt_file: ./prompt.txt\n"))
+                .unwrap();
+        manifest.resolve_relative_paths(Path::new("/repo/agent"));
+        let resolved = manifest.annotators["judge"]
+            .fields
+            .get("system_prompt_file")
+            .and_then(JsonValue::as_str)
+            .unwrap();
+        assert_eq!(resolved, "/repo/agent/./prompt.txt");
+    }
+
+    #[test]
+    fn fetch_pinned_https_bytes_returns_verified_body() {
+        let url = "https://policy.example/prompt.txt";
+        let body = b"be strict and concise".to_vec();
+        let fetcher = MockFetcher::new(BTreeMap::from([(url.to_string(), body.clone())]));
+        let value = serde_json::json!({"url": url, "sha256": hex_sha256(&body)});
+        let fetched =
+            fetch_pinned_https_bytes_with(&value, Limits::default(), &fetcher).expect("fetch ok");
+        assert_eq!(fetched, body);
+    }
+
+    #[test]
+    fn fetch_pinned_https_bytes_rejects_hash_mismatch() {
+        let url = "https://policy.example/prompt.txt";
+        let fetcher = MockFetcher::new(BTreeMap::from([(url.to_string(), b"tampered".to_vec())]));
+        let value = serde_json::json!({"url": url, "sha256": hex_sha256(b"original")});
+        let error = fetch_pinned_https_bytes_with(&value, Limits::default(), &fetcher).unwrap_err();
+        assert!(error.detail().contains("sha256 mismatch"), "got: {error}");
+    }
+
+    #[test]
+    fn fetch_pinned_https_bytes_rejects_missing_pin() {
+        let url = "https://policy.example/prompt.txt";
+        let fetcher = MockFetcher::new(BTreeMap::from([(url.to_string(), b"x".to_vec())]));
+        let value = serde_json::json!({"url": url});
+        let error = fetch_pinned_https_bytes_with(&value, Limits::default(), &fetcher).unwrap_err();
+        assert!(
+            error.detail().contains("must declare a 'sha256'"),
+            "got: {error}"
+        );
+        assert_eq!(fetcher.calls(url), 0, "must not fetch an unpinned URL");
+    }
+
+    #[test]
+    fn fetch_pinned_https_bytes_accepts_sri_integrity() {
+        let url = "https://policy.example/prompt.txt";
+        let body = b"audit everything".to_vec();
+        let fetcher = MockFetcher::new(BTreeMap::from([(url.to_string(), body.clone())]));
+        let value = serde_json::json!({"url": url, "integrity": sri(&body)});
+        let fetched =
+            fetch_pinned_https_bytes_with(&value, Limits::default(), &fetcher).expect("fetch ok");
+        assert_eq!(fetched, body);
     }
 }

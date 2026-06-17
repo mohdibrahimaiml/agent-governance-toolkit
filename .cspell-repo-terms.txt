@@ -3,6 +3,9 @@ ATF
 AAIF
 abprs
 abspath
+agentrust
+isfile
+reimplementation
 abstractmethod
 Acta
 addinfourl

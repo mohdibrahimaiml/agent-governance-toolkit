@@ -4,13 +4,14 @@
 
 from __future__ import annotations
 
+import importlib
 import warnings
 
 import pytest
 
 pytest.importorskip("fastapi")
 
-import agentmesh  # noqa: E402  (import first so its module-level DeprecationWarning fires once)
+importlib.import_module("agentmesh")  # side effect: fire the package-level DeprecationWarning once, before create_app() is wrapped
 from agentmesh.engine_api import (  # noqa: E402
     CAPABILITY_EXTENSION_KEY,
     create_app,
@@ -138,12 +139,12 @@ class TestStartup:
 
 class TestPackageExports:
     def test_create_app_is_lazily_exported(self):
-        import agentmesh.engine_api as pkg
+        pkg = importlib.import_module("agentmesh.engine_api")
 
         assert callable(pkg.create_app)
 
     def test_unknown_attribute_raises_attribute_error(self):
-        import agentmesh.engine_api as pkg
+        pkg = importlib.import_module("agentmesh.engine_api")
 
         with pytest.raises(AttributeError, match="no attribute 'does_not_exist'"):
             pkg.does_not_exist

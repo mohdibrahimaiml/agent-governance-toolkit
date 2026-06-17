@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from agentmesh.governance.audit import AuditEntry, AuditLog
+from agentmesh.governance.audit import AuditLog
 from agentmesh.governance.govern import govern
 from agentmesh.governance.trace_sink import (
     TRACEAuditSink,

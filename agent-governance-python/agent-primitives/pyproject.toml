@@ -34,7 +34,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "agent-governance-toolkit-core>=4.0.0,<5.0",
+    "agent-governance-toolkit-core>=4.1.0,<5.0",
     "pydantic>=2.13.4,<3.0",
 ]
 
@@ -58,10 +58,10 @@ include-package-data = true
 "*" = ["py.typed"]
 
 [tool.ruff]
-target-version = "py38"
+target-version = "py310"
 line-length = 100
 
 [tool.mypy]
-python_version = "3.8"
+python_version = "3.10"
 warn_return_any = true
 disallow_untyped_defs = true

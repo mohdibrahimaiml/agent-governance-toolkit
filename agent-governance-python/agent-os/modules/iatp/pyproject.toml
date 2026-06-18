@@ -99,7 +99,7 @@ include-package-data = true
 # Ruff - Fast Python Linter & Formatter
 # ============================================================================
 [tool.ruff]
-target-version = "py38"
+target-version = "py310"
 line-length = 100
 select = [
     "E",      # pycodestyle errors
@@ -129,7 +129,7 @@ known-first-party = ["iatp"]
 # MyPy - Static Type Checking
 # ============================================================================
 [tool.mypy]
-python_version = "3.8"
+python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true

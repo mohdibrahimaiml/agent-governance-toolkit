@@ -7,7 +7,7 @@ name = "langgraph_agentmesh"
 version = "4.1.0"
 description = "Deprecated. Previously published as langgraph-agentmesh. Install agent-governance-toolkit-integrations[langgraph] instead."
 license = {text = "MIT"}
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [
     {name = "Microsoft Corporation", email = "agentgovtoolkit@microsoft.com"},
 ]

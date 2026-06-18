@@ -7,7 +7,7 @@ name = "agent_os_kernel"
 version = "4.1.0"
 description = "Deprecated. Previously published as agent-os-kernel. Install agent-governance-toolkit-core instead."
 license = {text = "MIT"}
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [
     {name = "Microsoft Corporation", email = "agentgovtoolkit@microsoft.com"},
 ]
@@ -79,7 +79,7 @@ packages = ["src/agent_os"]
 # such as agent_os/integrations/__init__.py. Restoring them keeps CI green.
 # ============================================================================
 [tool.ruff]
-target-version = "py310"
+target-version = "py311"
 line-length = 100
 src = ["src", "modules"]
 

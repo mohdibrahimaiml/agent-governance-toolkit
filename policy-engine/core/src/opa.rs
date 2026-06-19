@@ -243,15 +243,14 @@ fn remote_bundle_token() -> String {
 /// reason is remapped to `PolicyInvocationFailed`. A size breach keeps its
 /// `ResourceLimitExceeded` reason.
 fn fetch_remote_bundle(value: &JsonValue, limits: Limits) -> Result<RemoteBundle, RuntimeError> {
-    let body = crate::manifest::fetch_pinned_https_bytes(value, limits).map_err(
-        |err| match err {
+    let body =
+        crate::manifest::fetch_pinned_https_bytes(value, limits).map_err(|err| match err {
             RuntimeError::ResourceLimitExceeded(_) => err,
             other => RuntimeError::PolicyInvocationFailed(format!(
                 "failed to resolve remote rego bundle: {}",
                 other.detail()
             )),
-        },
-    )?;
+        })?;
     write_remote_bundle(&body)
 }
 

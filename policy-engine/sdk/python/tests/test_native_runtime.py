@@ -308,6 +308,14 @@ class ZeroConfigDefaultsTests(unittest.TestCase):
             AgentControl.from_url("http://policy.example/manifest.yaml", sha256=None)
         self.assertIn("unsupported URL scheme", str(ctx.exception))
 
+    def test_from_url_malformed_pin_fails_closed_before_fetch(self):
+        # A supplied pin is validated for format before any network access, which
+        # confirms the sha256 argument threads through the Python wrapper, the
+        # native binding, and the core loader. "zz" is not 64 hex characters.
+        with self.assertRaises(RuntimeError) as ctx:
+            AgentControl.from_url("https://policy.example/manifest.yaml", sha256="zz")
+        self.assertIn("runtime_error:manifest_invalid", str(ctx.exception))
+
     def test_from_path_bad_explicit_opa_path_fails_closed_on_evaluation(self):
         import os
         import tempfile

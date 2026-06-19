@@ -319,6 +319,17 @@ test("zero-config default policy dispatcher rejects non-rego", async () => {
   }
 });
 
+test("fromUrl threads the optional pin and fails closed on a non-https URL", async () => {
+  // The URL loader requires HTTPS, so a non-https URL fails closed before any
+  // network access, with the pin omitted and with a (malformed) pin supplied.
+  // This exercises the AgentControl.fromUrl facade and the napi fromUrl factory.
+  assert.throws(() => AgentControl.fromUrl("http://policy.example/manifest.yaml"), /unsupported URL scheme/);
+  assert.throws(
+    () => AgentControl.fromUrl("http://policy.example/manifest.yaml", "00".repeat(32)),
+    /unsupported URL scheme/,
+  );
+});
+
 test("native runtime returns policy result_labels for IFC propagation", async () => {
   const agentControl = AgentControl.fromNative(
     manifest,

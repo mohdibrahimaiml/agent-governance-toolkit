@@ -208,20 +208,40 @@ impl Manifest {
         }
     }
 
-    /// Reject filesystem path fields on a manifest that was not loaded from the
-    /// file system, i.e. a URL sourced manifest. Without a file system manifest
-    /// root these fields resolve against the process working directory at
-    /// dispatch, which would let a remote manifest read local files and
-    /// exfiltrate them through a dispatcher. A URL sourced manifest MUST
-    /// reference remote artefacts through the `*_url` forms or inline text, so a
-    /// rego `bundle`, an annotator `system_prompt_file`, a cedar path, or adapter
-    /// `data`/`data_paths` fails closed.
-    fn reject_filesystem_path_fields(&self) -> Result<(), RuntimeError> {
+    /// Reject fields on a manifest that was not loaded from the file system, i.e.
+    /// a URL sourced manifest, that would let the remote manifest reach a local
+    /// resource at dispatch. Without a file system manifest root, filesystem path
+    /// fields resolve against the process working directory, so a rego `bundle`,
+    /// an annotator `system_prompt_file`, a cedar path, or adapter `data` fails
+    /// closed. Separately, a URL sourced manifest also controls an `llm`
+    /// annotator's dispatch `endpoint`, so it MUST NOT be allowed to read host
+    /// environment secrets through `api_key_env` / `aws_*_env`; otherwise a
+    /// malicious remote manifest could name `AWS_SECRET_ACCESS_KEY` and ship it
+    /// to an attacker chosen endpoint. Both classes fail closed, so a URL sourced
+    /// manifest references remote artefacts through the `*_url` forms or inline
+    /// text and supplies any credential inline rather than from the host env.
+    fn reject_url_sourced_local_access(&self) -> Result<(), RuntimeError> {
+        // Annotator fields that read the host environment at dispatch. A URL
+        // sourced manifest that also picks the egress endpoint must not read
+        // these, or it can exfiltrate a host secret to an attacker endpoint.
+        const HOST_ENV_SECRET_FIELDS: &[&str] = &[
+            "api_key_env",
+            "aws_access_key_id_env",
+            "aws_secret_access_key_env",
+            "aws_session_token_env",
+        ];
         for (name, annotator) in &self.annotators {
             if annotator.fields.contains_key(FIELD_SYSTEM_PROMPT_FILE) {
                 return Err(RuntimeError::ManifestInvalid(format!(
                     "annotator '{name}' declares filesystem path field 'system_prompt_file' in a URL sourced manifest; use 'system_prompt_url' instead"
                 )));
+            }
+            for field in HOST_ENV_SECRET_FIELDS {
+                if annotator.fields.contains_key(*field) {
+                    return Err(RuntimeError::ManifestInvalid(format!(
+                        "annotator '{name}' declares host environment secret field '{field}' in a URL sourced manifest; a URL sourced manifest must not read host secrets because it also controls the dispatch endpoint and could exfiltrate them, supply the credential inline instead"
+                    )));
+                }
             }
         }
         for (id, policy) in &self.policies {
@@ -625,7 +645,7 @@ impl ManifestLoader {
         let result = self.load_location_with_body(location.clone(), Some(body), &location);
         self.trust_root = previous_root;
         let manifest = result?;
-        manifest.reject_filesystem_path_fields()?;
+        manifest.reject_url_sourced_local_access()?;
         manifest.validate()?;
         Ok(manifest)
     }
@@ -1171,8 +1191,44 @@ fn validate_url_components(mut parsed: url::Url) -> Result<String, RuntimeError>
             parsed
         )));
     }
+    // SSRF guard: reject a literal loopback or link-local destination. Link-local
+    // covers the cloud metadata endpoint 169.254.169.254 (and fe80::/10). RFC1918
+    // private ranges are intentionally NOT blocked here, because hosting a policy
+    // bundle or manifest on an internal HTTPS host is a legitimate deployment;
+    // hostname based SSRF (a name that resolves into these ranges, or DNS
+    // rebinding) and per redirect hop re validation are tracked follow-ups.
+    match parsed.host() {
+        Some(url::Host::Ipv4(ip)) if is_blocked_fetch_ip(std::net::IpAddr::V4(ip)) => {
+            return Err(RuntimeError::ManifestInvalid(format!(
+                "URL '{parsed}' targets a loopback or link-local address, which is blocked to prevent SSRF to a host-local or cloud metadata endpoint"
+            )));
+        }
+        Some(url::Host::Ipv6(ip)) if is_blocked_fetch_ip(std::net::IpAddr::V6(ip)) => {
+            return Err(RuntimeError::ManifestInvalid(format!(
+                "URL '{parsed}' targets a loopback or link-local address, which is blocked to prevent SSRF to a host-local or cloud metadata endpoint"
+            )));
+        }
+        _ => {}
+    }
     parsed.set_fragment(None);
     Ok(parsed.to_string())
+}
+
+/// Return true for IP destinations that a manifest URL fetch must not target,
+/// to prevent server side request forgery to the host itself or to a cloud
+/// metadata endpoint. Loopback, the unspecified address, the IPv4 broadcast
+/// address, and link-local (IPv4 169.254.0.0/16 including 169.254.169.254, and
+/// IPv6 fe80::/10) are blocked. RFC1918 and IPv6 unique-local are deliberately
+/// allowed so internal HTTPS policy hosting keeps working.
+fn is_blocked_fetch_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || v4.is_broadcast()
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
 }
 
 fn has_url_scheme(reference: &str) -> bool {
@@ -2327,6 +2383,28 @@ intervention_points:
     }
 
     #[test]
+    fn from_url_rejects_host_env_secret_fields() {
+        // A URL sourced manifest also picks the dispatch endpoint, so it must not
+        // read host environment secrets, or a remote manifest could name a
+        // credential env var and exfiltrate it to an attacker endpoint.
+        let url = "https://policy.example/top.yaml";
+        for field in [
+            "api_key_env",
+            "aws_access_key_id_env",
+            "aws_secret_access_key_env",
+            "aws_session_token_env",
+        ] {
+            let body = format!(
+                "agent_control_specification_version: 0.3.1-beta\npolicies:\n  p:\n    type: test\nannotators:\n  judge:\n    type: llm\n    {field}: AWS_SECRET_ACCESS_KEY\nintervention_points:\n  input:\n    policy_target: $snap.input\n    policy:\n      id: p\n"
+            );
+            let fetcher = MockFetcher::new(BTreeMap::from([(url.to_string(), body.into_bytes())]));
+            let error = load_url_with_fetcher(url, None, fetcher, Limits::default()).unwrap_err();
+            assert_eq!(error.reason(), "runtime_error:manifest_invalid");
+            assert!(error.detail().contains("host environment secret"));
+        }
+    }
+
+    #[test]
     fn from_url_rejects_sha256_mismatch() {
         let url = "https://policy.example/top.yaml";
         let body = base_manifest().as_bytes().to_vec();
@@ -2353,6 +2431,33 @@ intervention_points:
 
         assert_eq!(error.reason(), "runtime_error:manifest_invalid");
         assert!(error.detail().contains("unsupported URL scheme"));
+    }
+
+    #[test]
+    fn from_url_rejects_loopback_and_link_local_ssrf() {
+        // A loopback or link-local destination is blocked before any fetch, so a
+        // manifest URL cannot be aimed at the host itself or a cloud metadata
+        // endpoint. RFC1918 private hosts stay allowed for internal hosting.
+        for url in [
+            "https://127.0.0.1/m.yaml",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://[::1]/m.yaml",
+            "https://0.0.0.0/m.yaml",
+        ] {
+            let error = load_url_with_fetcher(
+                url,
+                None,
+                MockFetcher::new(BTreeMap::new()),
+                Limits::default(),
+            )
+            .unwrap_err();
+            assert_eq!(error.reason(), "runtime_error:manifest_invalid");
+            assert!(
+                error.detail().contains("loopback or link-local"),
+                "unexpected detail for {url}: {}",
+                error.detail()
+            );
+        }
     }
 
     #[test]

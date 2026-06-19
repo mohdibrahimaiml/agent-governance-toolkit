@@ -111,6 +111,59 @@ impl PolicyConfig {
             }
         }
     }
+
+    /// Reject filesystem path fields declared on a policy. A URL sourced manifest
+    /// has no file system manifest root, so a rego `bundle`, a cedar
+    /// `policy_path`/`entities_path`/`schema_path`, or adapter `data`/`data_paths`
+    /// would resolve against the process working directory at dispatch. A URL
+    /// sourced manifest MUST use the `bundle_url` form or inline policy text, so
+    /// any such field fails closed.
+    pub fn reject_filesystem_path_fields(&self, context: &str) -> Result<(), RuntimeError> {
+        match self {
+            Self::Rego(config) => {
+                if config.bundle.is_some() {
+                    return Err(filesystem_field_error(context, "bundle", "bundle_url"));
+                }
+                reject_adapter_data_paths(&config.adapter_config, context)?;
+            }
+            Self::Cedar(config) => {
+                for (field, value) in [
+                    ("policy_path", &config.policy_path),
+                    ("entities_path", &config.entities_path),
+                    ("schema_path", &config.schema_path),
+                ] {
+                    if value.is_some() {
+                        return Err(filesystem_field_error(context, field, "inline policy text"));
+                    }
+                }
+            }
+            Self::Test(config) => reject_adapter_data_paths(&config.adapter_config, context)?,
+            Self::Custom(config) => reject_adapter_data_paths(&config.adapter_config, context)?,
+        }
+        Ok(())
+    }
+}
+
+fn reject_adapter_data_paths(
+    adapter_config: &BTreeMap<String, JsonValue>,
+    context: &str,
+) -> Result<(), RuntimeError> {
+    for key in DATA_PATH_KEYS {
+        if adapter_config.contains_key(key) {
+            return Err(filesystem_field_error(
+                context,
+                key,
+                "an inline or URL form",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn filesystem_field_error(context: &str, field: &str, alternative: &str) -> RuntimeError {
+    RuntimeError::ManifestInvalid(format!(
+        "{context} declares filesystem path field '{field}' in a URL sourced manifest; a URL sourced manifest cannot reference local files, use {alternative} instead"
+    ))
 }
 
 impl PolicyBinding {
@@ -118,6 +171,12 @@ impl PolicyBinding {
     /// against the directory of the manifest file that declared them.
     pub fn resolve_relative_paths(&mut self, base_dir: &Path) {
         resolve_adapter_config_paths(&mut self.adapter_config, base_dir);
+    }
+
+    /// Reject filesystem path fields declared on a policy binding. Used for a
+    /// URL sourced manifest, which has no file system manifest root.
+    pub fn reject_filesystem_path_fields(&self, context: &str) -> Result<(), RuntimeError> {
+        reject_adapter_data_paths(&self.adapter_config, context)
     }
 }
 

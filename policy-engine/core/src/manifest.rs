@@ -208,6 +208,33 @@ impl Manifest {
         }
     }
 
+    /// Reject filesystem path fields on a manifest that was not loaded from the
+    /// file system, i.e. a URL sourced manifest. Without a file system manifest
+    /// root these fields resolve against the process working directory at
+    /// dispatch, which would let a remote manifest read local files and
+    /// exfiltrate them through a dispatcher. A URL sourced manifest MUST
+    /// reference remote artefacts through the `*_url` forms or inline text, so a
+    /// rego `bundle`, an annotator `system_prompt_file`, a cedar path, or adapter
+    /// `data`/`data_paths` fails closed.
+    fn reject_filesystem_path_fields(&self) -> Result<(), RuntimeError> {
+        for (name, annotator) in &self.annotators {
+            if annotator.fields.contains_key(FIELD_SYSTEM_PROMPT_FILE) {
+                return Err(RuntimeError::ManifestInvalid(format!(
+                    "annotator '{name}' declares filesystem path field 'system_prompt_file' in a URL sourced manifest; use 'system_prompt_url' instead"
+                )));
+            }
+        }
+        for (id, policy) in &self.policies {
+            policy.reject_filesystem_path_fields(&format!("policy '{id}'"))?;
+        }
+        for (point, config) in &self.intervention_points {
+            config.policy.reject_filesystem_path_fields(&format!(
+                "intervention point {point} policy binding"
+            ))?;
+        }
+        Ok(())
+    }
+
     pub fn from_path_with_limits(
         path: impl AsRef<Path>,
         limits: Limits,
@@ -220,13 +247,13 @@ impl Manifest {
     /// URL MUST be HTTPS, carries no ambient credentials, and is bounded by the
     /// same body size limit as URL extends. The `sha256` pin is optional and
     /// mirrors URL `extends`, where an unpinned URL is trusted because the host
-    /// chose it. When `sha256` is supplied it MUST be a 64 character hexadecimal
-    /// SHA-256 digest over the fetched bytes and a mismatch MUST fail closed; a
-    /// non HTTPS URL, a fetch error, or a body size breach MUST fail closed
-    /// regardless. Filesystem relative fields such as a rego `bundle`, an
-    /// annotator `system_prompt_file`, or adapter `data` paths are NOT rebased
-    /// for a URL sourced manifest, mirroring URL `extends`; a URL manifest should
-    /// reference remote artefacts through the `*_url` forms.
+    /// chose it. Pass `None` for an unpinned load; a supplied pin (including a
+    /// blank string) MUST be a 64 character hexadecimal SHA-256 digest over the
+    /// fetched bytes, and a mismatch, a malformed pin, a non HTTPS URL, a fetch
+    /// error, or a body size breach MUST fail closed. A URL sourced manifest
+    /// cannot reference local files, so a rego `bundle`, an annotator
+    /// `system_prompt_file`, a cedar path, or adapter `data` field fails closed;
+    /// use the `*_url` forms or inline text instead.
     pub fn from_url(url: &str, sha256: Option<&str>) -> Result<Self, RuntimeError> {
         Self::from_url_with_limits(url, sha256, Limits::default())
     }
@@ -579,9 +606,10 @@ impl ManifestLoader {
     /// pin pass through the same trust gate as a URL `extends` entry. A URL
     /// sourced top level manifest has no filesystem trust root, so any local
     /// path `extends` inside it resolves against the URL rather than the file
-    /// system. An empty or whitespace only pin is treated as no pin.
+    /// system, and filesystem path fields fail closed. A supplied pin (including
+    /// a blank string) must be a valid 64 character hex digest or the load fails
+    /// closed; pass `None` for an unpinned load.
     fn load_url(&mut self, url: &str, sha256: Option<&str>) -> Result<Manifest, RuntimeError> {
-        let sha256 = sha256.map(str::trim).filter(|value| !value.is_empty());
         let pin = ManifestUrlExtends {
             url: url.to_string(),
             integrity: None,
@@ -590,13 +618,14 @@ impl ManifestLoader {
         let extends = ManifestExtends::Url(pin);
         validate_extends_trust(&extends)?;
         let normalized = validate_https_url(url)?;
-        let previous_root = self.trust_root.take();
         let body = self.fetch_url_body(&normalized)?;
         verify_extends_hash(&extends, &normalized, &body)?;
         let location = ManifestLocation::Url(normalized);
+        let previous_root = self.trust_root.take();
         let result = self.load_location_with_body(location.clone(), Some(body), &location);
         self.trust_root = previous_root;
         let manifest = result?;
+        manifest.reject_filesystem_path_fields()?;
         manifest.validate()?;
         Ok(manifest)
     }
@@ -2254,10 +2283,47 @@ intervention_points:
 
         assert!(manifest.policies.contains_key("p"));
         assert_eq!(fetcher.calls(url), 1);
+    }
 
-        // A whitespace only pin is treated as no pin rather than an error.
-        let blank = load_url_with_fetcher(url, Some("   "), fetcher, Limits::default()).unwrap();
-        assert!(blank.policies.contains_key("p"));
+    #[test]
+    fn from_url_rejects_blank_pin() {
+        // A supplied but blank pin is a malformed pin and fails closed, matching
+        // URL extends; only `None` means unpinned. The fetch never runs.
+        let url = "https://policy.example/top.yaml";
+        let body = base_manifest().as_bytes().to_vec();
+        for pin in ["", "   "] {
+            let fetcher = MockFetcher::new(BTreeMap::from([(url.to_string(), body.clone())]));
+            let error = load_url_with_fetcher(url, Some(pin), fetcher.clone(), Limits::default())
+                .unwrap_err();
+            assert_eq!(error.reason(), "runtime_error:manifest_invalid");
+            assert_eq!(fetcher.calls(url), 0);
+        }
+    }
+
+    #[test]
+    fn from_url_rejects_filesystem_path_fields() {
+        // A URL sourced manifest cannot reference local files; each filesystem
+        // path field fails closed so a remote manifest cannot read local files.
+        let url = "https://policy.example/top.yaml";
+        let cases = [
+            // rego bundle path
+            "agent_control_specification_version: 0.3.1-beta\npolicies:\n  p:\n    type: rego\n    bundle: ./policy\nintervention_points:\n  input:\n    policy_target: $snap.input\n    policy:\n      id: p\n",
+            // annotator system_prompt_file
+            "agent_control_specification_version: 0.3.1-beta\npolicies:\n  p:\n    type: test\nannotators:\n  judge:\n    type: llm\n    system_prompt_file: /etc/secret\nintervention_points:\n  input:\n    policy_target: $snap.input\n    policy:\n      id: p\n",
+            // cedar policy_path
+            "agent_control_specification_version: 0.3.1-beta\npolicies:\n  p:\n    type: cedar\n    policy_path: /etc/policy.cedar\nintervention_points:\n  input:\n    policy_target: $snap.input\n    policy:\n      id: p\n",
+            // adapter data path
+            "agent_control_specification_version: 0.3.1-beta\npolicies:\n  p:\n    type: rego\n    bundle_url:\n      url: https://policy.example/b.tar.gz\n      sha256: 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n    data: /etc/data.json\nintervention_points:\n  input:\n    policy_target: $snap.input\n    policy:\n      id: p\n",
+        ];
+        for body in cases {
+            let fetcher = MockFetcher::new(BTreeMap::from([(
+                url.to_string(),
+                body.as_bytes().to_vec(),
+            )]));
+            let error = load_url_with_fetcher(url, None, fetcher, Limits::default()).unwrap_err();
+            assert_eq!(error.reason(), "runtime_error:manifest_invalid");
+            assert!(error.detail().contains("URL sourced manifest"));
+        }
     }
 
     #[test]
